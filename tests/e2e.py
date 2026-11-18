@@ -350,6 +350,137 @@ class E2ETestCase(unittest.TestCase):
              expect=409)
         self.assertEqual(alert_status(fp)["status"], "recovered")
 
+    def test_09_budget_crud_and_live_accounting(self):
+        fp = "svc/budget"
+        # nothing configured yet
+        http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=404)
+
+        # invalid allowances are rejected before any write happens
+        http("PUT", f"{BASE}/api/budgets",
+             {"fingerprint": fp, "allowed_seconds": -1}, expect=422)
+        http("PUT", f"{BASE}/api/budgets",
+                          {"fingerprint": fp, "allowed_seconds": "x"}, expect=422)
+
+        _, created = http("PUT", f"{BASE}/api/budgets",
+                          {"fingerprint": fp, "allowed_seconds": 300}, expect=200)
+        self.assertEqual(created["allowed_seconds"], 300)
+        self.assertEqual(created["downtime_seconds"], 0)
+        self.assertEqual(created["remaining_seconds"], 300)
+        self.assertFalse(created["exhausted"])
+        set_at = created["set_at"]
+
+        # open fault: counted from firing receive time up to each query time
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 1, "kind": "firing", "summary": "leak"},
+             expect=200)
+        time.sleep(0.5)
+        _, open_b = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        self.assertGreaterEqual(open_b["downtime_seconds"], 0.45)
+        self.assertTrue(open_b["rounds"][0]["open"])
+
+        # recovery closes the round; accounting stops growing afterwards
+        time.sleep(0.2)
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 2, "kind": "recovery", "summary": "fixed"},
+             expect=200)
+        _, closed = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        gross = closed["downtime_seconds"] + closed["exempt_seconds"]
+        self.assertGreaterEqual(gross, 0.6)
+        self.assertAlmostEqual(closed["remaining_seconds"], 300 - gross, places=2)
+        self.assertFalse(closed["rounds"][0]["open"])
+        time.sleep(0.3)
+        _, later = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        self.assertEqual(later["downtime_seconds"], closed["downtime_seconds"])
+
+        # list endpoint contains the configured budget and keeps set_at stable
+        _, listing = http("GET", f"{BASE}/api/budgets", expect=200)
+        mine = next(b for b in listing["budgets"] if b["fingerprint"] == fp)
+        self.assertEqual(mine["set_at"], set_at)
+        self.assertEqual(mine["allowed_seconds"], 300)
+
+        # exhaustion: open a new fault round, then set a tiny allowance that
+        # the still-running fault must overshoot on the next query.
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 3, "kind": "firing", "summary": "again"},
+             expect=200)
+        _, exhausted = http("PUT", f"{BASE}/api/budgets",
+                            {"fingerprint": fp, "allowed_seconds": 0.05}, expect=200)
+        self.assertFalse(exhausted["exhausted"])  # fresh set_at: nothing counted yet
+        time.sleep(0.2)
+        _, over = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        self.assertTrue(over["exhausted"])
+        self.assertLess(over["remaining_seconds"], 0)
+
+    def test_10_budget_exempts_effective_silence_and_keeps_notifications(self):
+        fp = "svc/budget-silence"
+        http("PUT", f"{BASE}/api/budgets",
+             {"fingerprint": fp, "allowed_seconds": 1000}, expect=200)
+
+        # fault begins inside a silence: firing notification must stay parked
+        http("POST", f"{BASE}/api/silence",
+             {"duration_seconds": 30, "reason": "maint"}, expect=200)
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 1, "kind": "firing", "summary": "during silence"},
+             expect=200)
+        time.sleep(0.3)
+        self.assertEqual(outbox_rows(fp), [])
+
+        # extend the silence, then release it early: the sweep must release
+        # the still-firing alert exactly once (original behavior preserved)
+        http("POST", f"{BASE}/api/silence",
+             {"duration_seconds": 30, "reason": "extended"}, expect=200)
+        time.sleep(0.3)
+        http("DELETE", f"{BASE}/api/silence", expect=200)
+        rows = wait_delivered(fp, 1)
+        self.assertEqual(rows[0]["kind"], "firing")
+
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 2, "kind": "recovery", "summary": "done"},
+             expect=200)
+        wait_delivered(fp, 2)
+
+        _, b = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        # the silence actually covered part of the fault: that time is exempt
+        self.assertGreaterEqual(b["exempt_seconds"], 0.45)
+        # internal arithmetic is consistent: counted + exempt == gross fault span
+        gross_rounds = sum(r["counted_seconds"] + r["exempt_seconds"] for r in b["rounds"])
+        self.assertAlmostEqual(
+            gross_rounds, b["downtime_seconds"] + b["exempt_seconds"], places=2
+        )
+        self.assertGreaterEqual(b["remaining_seconds"],
+                                1000 - b["downtime_seconds"] - 0.01)
+        # exactly one firing + one recovery notification, no duplicates
+        self.assertEqual(len(outbox_rows(fp)), 2)
+
+    def test_11_budget_survives_restart(self):
+        fp = "svc/budget-restart"
+        _, created = http("PUT", f"{BASE}/api/budgets",
+                          {"fingerprint": fp, "allowed_seconds": 456}, expect=200)
+        http("POST", f"{BASE}/api/events",
+             {"fingerprint": fp, "seq": 1, "kind": "firing", "summary": "open across restart"},
+             expect=200)
+        time.sleep(0.3)
+
+        self.alert_server.stop_event.set()
+        self.alert_server.shutdown()
+        self.alert_server.server_close()
+        self.notifier_server.shutdown()
+        self.notifier_server.server_close()
+        time.sleep(0.2)
+        type(self).notifier_server = run_notifier_service("127.0.0.1", NOTIFIER_PORT)
+        type(self).alert_server = run_alert_service("127.0.0.1", ALERT_PORT)
+        wait_until("services healthy after restart", lambda: (
+            http("GET", f"{BASE}/health")[0] == 200
+            and http("GET", f"{NOTIFIER}/health")[0] == 200
+        ))
+
+        _, b = http("GET", f"{BASE}/api/budgets?fingerprint={fp}", expect=200)
+        self.assertEqual(b["allowed_seconds"], 456)
+        self.assertEqual(b["set_at"], created["set_at"])
+        # accounting continued against the still-open fault
+        self.assertGreaterEqual(b["downtime_seconds"], 0.25)
+        self.assertTrue(b["rounds"][0]["open"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

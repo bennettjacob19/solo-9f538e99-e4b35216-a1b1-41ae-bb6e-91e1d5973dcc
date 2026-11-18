@@ -87,6 +87,11 @@ class SilenceIn(BaseModel):
     reason: str = ""
 
 
+class BudgetIn(BaseModel):
+    fingerprint: str = Field(min_length=1)
+    allowed_seconds: float = Field(ge=0)
+
+
 # --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
@@ -145,6 +150,29 @@ def delete_silence() -> dict:
     # the outbox instead of waiting for the next worker tick.
     result["released"] = service.sweep_silences(_conn)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Downtime budget
+# --------------------------------------------------------------------------- #
+@app.put("/api/budgets")
+def put_budget(body: BudgetIn) -> dict:
+    try:
+        return service.set_budget(_conn, body.fingerprint, body.allowed_seconds)
+    except service.Reject as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "message": exc.message})
+
+
+@app.get("/api/budgets")
+def get_budgets(fingerprint: Optional[str] = None) -> dict:
+    if fingerprint is not None:
+        result = service.compute_budget(_conn, fingerprint)
+        if result is None:
+            raise HTTPException(status_code=404,
+                                detail={"error": "budget_not_found",
+                                        "message": f"no downtime budget for {fingerprint}"})
+        return result
+    return {"budgets": service.list_budgets(_conn), "now": time.time()}
 
 
 # --------------------------------------------------------------------------- #

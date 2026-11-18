@@ -204,6 +204,23 @@ def set_silence(
             "reason=excluded.reason, updated_at=excluded.updated_at",
             (until_ts, reason, now),
         )
+        # Record the *effective* window history. An active silence is simply
+        # extended (same open interval); an expired/absent one opens a new row.
+        open_row = conn.execute(
+            "SELECT id FROM silence_intervals WHERE ended_at IS NULL AND until_ts > ?",
+            (now,),
+        ).fetchone()
+        if open_row is not None:
+            conn.execute(
+                "UPDATE silence_intervals SET until_ts=?, reason=?, updated_at=? WHERE id=?",
+                (until_ts, reason, now, open_row["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO silence_intervals(started_at, until_ts, ended_at, reason, "
+                "updated_at) VALUES (?,?, NULL, ?, ?)",
+                (now, until_ts, reason, now),
+            )
     return get_silence(conn, now)
 
 
@@ -211,6 +228,13 @@ def clear_silence(conn: sqlite3.Connection, now: Optional[float] = None) -> dict
     now = time.time() if now is None else now
     with transaction(conn):
         conn.execute("DELETE FROM silences WHERE id=1")
+        # Early release: close the still-active interval at the release time.
+        # Expired open rows are left alone — their effective end is until_ts.
+        conn.execute(
+            "UPDATE silence_intervals SET ended_at=?, updated_at=? "
+            "WHERE ended_at IS NULL AND until_ts > ?",
+            (now, now, now),
+        )
     return {"active": False, "until_ts": None, "reason": None, "now": now}
 
 
@@ -294,6 +318,198 @@ def list_events(conn: sqlite3.Connection, fingerprint: str, limit: int = 100) ->
         (fingerprint, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Downtime budget accounting
+# --------------------------------------------------------------------------- #
+WINDOW_SECONDS = 24 * 3600.0
+
+
+def _effective_silence_intervals(
+    conn: sqlite3.Connection, lo: float, hi: float, now: float
+) -> list[tuple[float, float]]:
+    """Committed silence windows actually in effect, clipped to [lo, hi].
+
+    An open row whose until_ts has already passed ends at until_ts (natural
+    expiry), so accounting is correct even before the worker sweep closes it.
+    """
+    rows = conn.execute(
+        "SELECT started_at, until_ts, ended_at FROM silence_intervals "
+        "WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?) "
+        "ORDER BY started_at",
+        (hi, lo),
+    ).fetchall()
+    intervals: list[tuple[float, float]] = []
+    for r in rows:
+        start = r["started_at"]
+        end = r["ended_at"] if r["ended_at"] is not None else min(r["until_ts"], now)
+        if end <= start:
+            continue
+        start, end = max(start, lo), min(end, hi)
+        if end > start:
+            intervals.append((start, end))
+    return _merge_intervals(intervals)
+
+
+def _fault_intervals(conn: sqlite3.Connection, fp: str) -> list[tuple[float, float, float]]:
+    """Reconstruct fault rounds from the immutable event log.
+
+    Returns (firing_received_at, recovery_received_at_or_None, round_no)
+    tuples. A firing without a following recovery is still open. Timing uses
+    server-side receive time, never any timestamp supplied by the client.
+    """
+    rows = conn.execute(
+        "SELECT kind, received_at FROM events WHERE fingerprint=? ORDER BY seq",
+        (fp,),
+    ).fetchall()
+    faults: list[tuple[float, float, float]] = []
+    opened: Optional[float] = None
+    round_no = 0
+    for r in rows:
+        if r["kind"] == "firing":
+            if opened is None:
+                round_no += 1
+                opened = r["received_at"]
+        elif opened is not None:  # recovery closes the currently open round
+            faults.append((opened, r["received_at"], round_no))
+            opened = None
+    if opened is not None:
+        faults.append((opened, None, round_no))  # still firing: counted up to query time
+    return faults
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
+def _covered_seconds(
+    intervals: list[tuple[float, float]], cover: list[tuple[float, float]]
+) -> float:
+    """Total length of ``intervals`` that overlaps the (merged) cover set."""
+    total = 0.0
+    for start, end in intervals:
+        for c_start, c_end in cover:
+            if c_end <= start:
+                continue
+            if c_start >= end:
+                break
+            total += min(end, c_end) - max(start, c_start)
+    return total
+
+
+def compute_budget(
+    conn: sqlite3.Connection, fp: str, now: Optional[float] = None
+) -> Optional[dict]:
+    """Public entry point: run the accounting inside one serialized transaction."""
+    now = time.time() if now is None else now
+    with transaction(conn):
+        return _compute_budget(conn, fp, now)
+
+
+def _compute_budget(
+    conn: sqlite3.Connection, fp: str, now: float
+) -> Optional[dict]:
+    """Compute one fingerprint's downtime budget; caller owns the transaction.
+
+    Counting starts at the budget's ``set_at`` (faults already firing then are
+    counted from set_at) and never looks further back than 24 hours. Open
+    faults are counted up to ``now``; time covered by an effective silence is
+    exempt. Every number comes from the same connection/transaction so
+    interleaved event ingestion or silence edits cannot mix two states.
+    """
+    brow = conn.execute(
+        "SELECT * FROM budgets WHERE fingerprint=?", (fp,)
+    ).fetchone()
+    if brow is None:
+        return None
+
+    window_start = max(brow["set_at"], now - WINDOW_SECONDS)
+    window_end = now
+    silences = _effective_silence_intervals(conn, window_start, window_end, now)
+
+    gross = 0.0
+    exempt = 0.0
+    rounds: list[dict] = []
+    for fire_at, rec_at, round_no in _fault_intervals(conn, fp):
+        # An open fault runs to query time; a closed one to its recovery.
+        raw_end = window_end if rec_at is None else min(rec_at, window_end)
+        start, end = max(fire_at, window_start), raw_end
+        if end <= start:
+            continue
+        fault_piece = (start, end)
+        piece_gross = end - start
+        piece_exempt = _covered_seconds([fault_piece], silences)
+        gross += piece_gross
+        exempt += piece_exempt
+        rounds.append({
+            "round": round_no,
+            "firing_at": round(fire_at, 3),
+            "recovery_at": None if rec_at is None else round(rec_at, 3),
+            "open": rec_at is None,
+            "counted_seconds": round(piece_gross - piece_exempt, 3),
+            "exempt_seconds": round(piece_exempt, 3),
+        })
+
+    counted = gross - exempt
+    allowed = brow["allowed_seconds"]
+    remaining = allowed - counted
+    return {
+        "fingerprint": fp,
+        "allowed_seconds": round(allowed, 3),
+        "set_at": brow["set_at"],
+        "window_start": round(window_start, 3),
+        "now": round(now, 3),
+        "downtime_seconds": round(counted, 3),
+        "exempt_seconds": round(exempt, 3),
+        "remaining_seconds": round(remaining, 3),
+        "exhausted": remaining <= 0,
+        "rounds": rounds,
+    }
+
+
+def set_budget(
+    conn: sqlite3.Connection,
+    fingerprint: str,
+    allowed_seconds: float,
+    now: Optional[float] = None,
+) -> dict:
+    """Upsert a per-fingerprint downtime allowance; accounting restarts now."""
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise Reject("invalid_payload", "fingerprint must be a non-empty string")
+    if isinstance(allowed_seconds, bool) or not isinstance(allowed_seconds, (int, float)):
+        raise Reject("invalid_payload", "allowed_seconds must be a non-negative number")
+    if allowed_seconds < 0:
+        raise Reject("invalid_payload", "allowed_seconds must be >= 0")
+    now = time.time() if now is None else now
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO budgets(fingerprint, allowed_seconds, set_at, updated_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET "
+            "allowed_seconds=excluded.allowed_seconds, set_at=excluded.set_at, "
+            "updated_at=excluded.updated_at",
+            (fingerprint, float(allowed_seconds), now, now),
+        )
+        result = _compute_budget(conn, fingerprint, now)
+    assert result is not None
+    return result
+
+
+def list_budgets(conn: sqlite3.Connection, now: Optional[float] = None) -> list[dict]:
+    now = time.time() if now is None else now
+    with transaction(conn):
+        fps = [r["fingerprint"] for r in conn.execute(
+            "SELECT fingerprint FROM budgets ORDER BY fingerprint"
+        ).fetchall()]
+        results = [_compute_budget(conn, fp, now) for fp in fps]
+    return [r for r in results if r is not None]
 
 
 # --------------------------------------------------------------------------- #

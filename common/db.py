@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS silences (
     reason     TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL
 );
+
+-- History of silence windows as they actually took effect. A new silence opens
+-- a row; extending an active silence moves until_ts; an early release records
+-- ended_at. Rows left open past until_ts are treated as ending at until_ts at
+-- read time, so downtime accounting never depends on a worker sweep running.
+CREATE TABLE IF NOT EXISTS silence_intervals (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at REAL NOT NULL,
+    until_ts   REAL NOT NULL,
+    ended_at   REAL,
+    reason     TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_silence_intervals_open
+    ON silence_intervals(ended_at);
+
+-- Per-fingerprint unplanned-downtime allowance. Accounting starts at set_at and
+-- only ever reads committed rows elsewhere, so a failed/rejected write leaves
+-- the previous budget fully queryable.
+CREATE TABLE IF NOT EXISTS budgets (
+    fingerprint     TEXT PRIMARY KEY,
+    allowed_seconds REAL NOT NULL CHECK (allowed_seconds >= 0),
+    set_at          REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
 """
 
 

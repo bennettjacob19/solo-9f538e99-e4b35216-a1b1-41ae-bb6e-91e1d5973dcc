@@ -76,4 +76,7 @@ th { color: var(--muted); font-weight: 600; }
 .badge-failed { background: rgba(239,68,68,.18); color: var(--bad); }
 .silence-on { color: var(--warn); font-weight: 600; }
 .silence-off { color: var(--ok); }
+.budget-ok { color: var(--ok); font-weight: 600; }
+.budget-exhausted { color: var(--bad); font-weight: 700; }
+.fp-link { cursor: pointer; text-decoration: underline dotted; }
 code { color: var(--accent); }

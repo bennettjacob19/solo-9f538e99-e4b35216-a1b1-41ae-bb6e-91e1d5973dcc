@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs
 
 from common import notifier_core, service
 from common.config import AppConfig, NotifierConfig
@@ -74,7 +75,7 @@ class JsonRouter(BaseHTTPRequestHandler):
             return None
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path in ("/", "/index.html"):
             self._file(self.static_index, "text/html; charset=utf-8")
             return
@@ -90,7 +91,7 @@ class JsonRouter(BaseHTTPRequestHandler):
             return
         for method, prefix, handler in self.routes:
             if method == "GET" and path == prefix:
-                self._dispatch(handler, {})
+                self._dispatch(handler, {"_query": query})
                 return
         self._json(404, {"error": "not_found"})
 
@@ -101,6 +102,17 @@ class JsonRouter(BaseHTTPRequestHandler):
             return
         for method, prefix, handler in self.routes:
             if method == "POST" and path == prefix:
+                self._dispatch(handler, body)
+                return
+        self._json(404, {"error": "not_found"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        body = self._read_json()
+        if body is None:
+            return
+        for method, prefix, handler in self.routes:
+            if method == "PUT" and path == prefix:
                 self._dispatch(handler, body)
                 return
         self._json(404, {"error": "not_found"})
@@ -119,6 +131,9 @@ class JsonRouter(BaseHTTPRequestHandler):
         except (service.Reject, notifier_core.NotifierReject) as exc:
             status = 409 if isinstance(exc, service.Reject) else 422
             self._json(status, {"error": exc.code, "message": exc.message})
+            return
+        except LookupError as exc:
+            self._json(404, {"error": "not_found", "message": str(exc)})
             return
         except ValueError as exc:
             self._json(422, {"error": "invalid_payload", "message": str(exc)})
@@ -210,6 +225,27 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
         result["released"] = service.sweep_silences(conn)
         return result
 
+    def h_budget_set(body: Any) -> dict:
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        fp = body.get("fingerprint")
+        if not isinstance(fp, str) or not fp.strip():
+            raise ValueError("fingerprint must be a non-empty string")
+        allowed = body.get("allowed_seconds")
+        if not isinstance(allowed, (int, float)) or isinstance(allowed, bool) or allowed < 0:
+            raise ValueError("allowed_seconds must be a non-negative number")
+        return service.set_budget(conn, fp, float(allowed))
+
+    def h_budget_get(body: Any) -> dict:
+        params = parse_qs(body.get("_query", ""))
+        fp = (params.get("fingerprint") or [""])[0]
+        if not fp:
+            return {"budgets": service.list_budgets(conn), "now": time.time()}
+        result = service.compute_budget(conn, fp)
+        if result is None:
+            raise LookupError(f"no downtime budget for {fp}")
+        return result
+
     import os
     web_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
     web_index = os.path.join(web_root, "index.html")
@@ -223,6 +259,8 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
             ("GET", "/api/silence", h_silence_get),
             ("POST", "/api/silence", h_silence_set),
             ("DELETE", "/api/silence", h_silence_clear),
+            ("PUT", "/api/budgets", h_budget_set),
+            ("GET", "/api/budgets", h_budget_get),
         ],
         "static_index": web_index,
         "static_dir": os.path.join(web_root, "static"),
